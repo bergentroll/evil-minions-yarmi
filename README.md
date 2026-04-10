@@ -1,126 +1,93 @@
 ## evil-minions
 
-`evil-minions` — генератор нагрузки для [Salt](https://github.com/saltstack/salt).
-Он используется для тестирования масштабируемости Salt, [Uyuni](https://www.uyuni-project.org/)
-и [SUSE Manager](https://www.suse.com/products/suse-manager/).
+Инструмент нагрузочного тестирования [Salt](https://github.com/saltstack/salt) в связке с [Uyuni](https://www.uyuni-project.org/) и [SUSE Manager](https://www.suse.com/products/suse-manager/).
 
-### Отличия этого форка
+### Назначение
 
-Этот репозиторий является форком `uyuni-project/evil-minions` и содержит
-практические доработки для современных окружений:
+Подменяется точка входа `salt-minion`: один реальный minion остаётся эталоном, дополнительно поднимается заданное число логических minion с префиксом id (по умолчанию `evil-*`). Для master они выглядят как отдельные узлы. Ответы на команды вне встроенных исключений воспроизводятся по заранее снятому с эталона трафику (baseline).
 
-- совместимость с Salt `3007.x` (onedir-пакеты);
-- запуск через встроенный Python Salt (`/opt/saltstack/salt/bin/python3.10`);
-- исправления совместимости с Python 3.13 (`distutils` -> `shutil.which`);
-- адаптация перехвата транспорта к актуальному API (`salt.channel.client`);
-- исправления обработки событий и callback в асинхронном режиме;
-- поддержка `glob`-таргетинга вида `evil-*` (кроме точных id и `*`);
-- обновлённые инструкции по установке и запуску для Debian/Ubuntu.
+### Форк от upstream
 
-Если вам нужна максимально близкая к upstream-версии логика без этих правок,
-используйте исходный репозиторий `uyuni-project/evil-minions`.
+База: `uyuni-project/evil-minions`. В данном репозитории:
 
-### Что это
+- Salt 3007.x, onedir, запуск через `/opt/saltstack/salt/bin/python3.10`;
+- совместимость с Python 3.13 (отказ от `distutils` в пользу `shutil.which` и аналогов там, где нужно);
+- перехват через актуальный `salt.channel.client`;
+- доработки асинхронных callback;
+- таргетинг `glob` для шаблонов вида `evil-*`;
+- один ZMQ PUSH на процесс при пересылке событий в прокси (вместо сокета на сообщение);
+- `--log-level`, уровень наследуется в дочерних процессах (`EVIL_MINIONS_LOG_LEVEL`);
+- число процессов Hydra: из `--processes` либо авто от `--count` и `cpu_count()` (верхняя граница 56);
+- интервал ожидания baseline в `mimic()`: из `--mimic-poll` либо авто от `--count`;
+- корректный выход из `mimic()` при стартовом вызове с `fun is None`.
 
-`evil-minions` подменяет запуск `salt-minion` и поднимает рядом набор
-симулированных minion-узлов ("evil" minions).
-
-Эти minion-узлы:
-
-- копируют поведение реального minion;
-- отвечают мастеру как отдельные узлы (с разными id);
-- работают достаточно легко, чтобы запускать сотни и тысячи экземпляров.
+Upstream без этих изменений: `uyuni-project/evil-minions`.
 
 ### Установка
 
-#### SUSE (RPM)
+**RPM (SUSE)** — при необходимости заменить URL репозитория под дистрибутив:
 
 ```bash
-# при необходимости замените openSUSE_Leap_15.0 на нужный дистрибутив
 zypper addrepo https://download.opensuse.org/repositories/systemsmanagement:/sumaform:/tools/openSUSE_Leap_15.0/systemsmanagement:sumaform:tools.repo
 zypper install evil-minions
 ```
 
-#### Debian/Ubuntu и другие дистрибутивы (из исходников)
+**Исходники (Debian/Ubuntu и др.)**:
 
 ```bash
 git clone https://github.com/moio/evil-minions.git
 cd evil-minions
-
-# пример зависимостей для Debian (без system-wide pip, совместимо с PEP 668)
 sudo apt-get install -y python3-msgpack python3-zmq python3-tornado
 ```
 
-### Настройка systemd
-
-Создайте drop-in для `salt-minion` и используйте `override.conf` из репозитория:
+### systemd
 
 ```bash
 sudo mkdir -p /etc/systemd/system/salt-minion.service.d
 sudo cp override.conf /etc/systemd/system/salt-minion.service.d/override.conf
+# заменить /path/to/evil-minions на каталог установки
 sudo systemctl daemon-reload
 sudo systemctl restart salt-minion
 ```
 
-Для Salt onedir (например, `/opt/saltstack/salt`) рекомендуется запуск через
-встроенный Python и рабочую директорию проекта:
+Пример `ExecStart` для onedir (пути и `--count` правятся под среду):
 
 ```ini
 [Service]
 ExecStart=
-ExecStart=/opt/saltstack/salt/bin/python3.10 /home/user/evil-minions/evil-minions --count=10 --ramp-up-delay=0 --slowdown-factor=0.0
-WorkingDirectory=/home/user/evil-minions
+ExecStart=/opt/saltstack/salt/bin/python3.10 /path/to/evil-minions/evil-minions --count=100 --ramp-up-delay=0 --slowdown-factor=0.0 --log-level=INFO
+WorkingDirectory=/path/to/evil-minions
 ```
 
-### Использование
+В репозитории `override.conf` содержит тот же шаблон; фактическое число minion задаётся в `ExecStart`. Справка по ключам: `evil-minions --help`.
 
-После запуска `salt-minion` автоматически поднимаются evil minions
-(`--count=10` по умолчанию).
+### Параметры запуска
 
-Базовая проверка:
+| Параметр | Назначение |
+|----------|------------|
+| `--count` | Число симулируемых minion (дефолт скрипта: 100). |
+| `--id-prefix`, `--id-offset` | Префикс и смещение id. |
+| `--ramp-up-delay` | Задержка между стартами соседних голов, сек. |
+| `--slowdown-factor` | Множитель задержек при проигрывании цепочки (0 — без замедления относительно записанных интервалов). |
+| `--random-slowdown-factor` | Случайная добавка к `slowdown-factor` (доля, 0–100). |
+| `--processes` | Число процессов Hydra; иначе авто от `--count` и CPU. |
+| `--mimic-poll` | Интервал опроса baseline в `mimic()`, сек.; иначе авто от `--count`. |
+| `--keysize` | Размер ключей minion, бит (дефолт 2048). |
+| `--log-level` | `DEBUG` … `CRITICAL`, дефолт `INFO`. |
+
+### Проверка
 
 ```bash
 salt '*' test.ping
 salt 'evil-*' test.ping
 ```
 
-Если evil minion получил незнакомую команду, он ждёт, пока реальный minion
-сначала выполнит её и "обучит" симуляцию.
-
-Параметры запуска задаются через `ExecStart` в файле:
-
-`/etc/systemd/system/salt-minion.service.d/override.conf`
-
-### Основные параметры
-
-#### `--count`
-
-Количество симулированных minion-узлов.
-
-#### `--ramp-up-delay`
-
-Задержка (в секундах) между запуском соседних evil minions.
-Полезно для плавного старта при большой нагрузке.
-
-#### `--slowdown-factor`
-
-Коэффициент замедления ответов:
-
-- `0.0` — максимально быстро;
-- `1.0` — примерно как исходный minion;
-- `2.0` — в 2 раза медленнее;
-- `0.5` — в 2 раза быстрее.
-
-#### `--random-slowdown-factor`
-
-Добавляет случайный разброс к `slowdown-factor`.
-Например, при `slowdown-factor=1.0` и `random-slowdown-factor=0.2`
-каждый evil minion получит постоянный коэффициент в диапазоне `1.0..1.2`.
+Команда без baseline у эталонного minion: ответ с ошибкой до первого успешного выполнения на реальном minion с тем же `fun`/аргументами.
 
 ### Ограничения
 
-- поддерживается только транспорт ZeroMQ;
-- таргетинг minion поддерживает `glob` (например, `evil-*`) и точные id;
-- часть возможностей Salt воспроизводится не полностью (`mine`, `beacon`,
-  `state.sls` с `concurrent`);
-- часть возможностей Uyuni не поддерживается (например, Action Chains).
+- Транспорт: ZeroMQ.
+- Таргетинг: `glob`, список id, точное совпадение id; compound и прочее — не заявлено.
+- Неполная эмуляция: `mine`, `beacon`, часть сценариев `state.sls` / concurrency.
+- Uyuni: без Action Chains и ряда специфичных функций.
+- Масштаб на одном хосте: рост `--count` линейно увеличивает число полноценных клиентских сессий (сеть, CPU, крипта). Для больших значений — несколько узлов или снижение `--count`.

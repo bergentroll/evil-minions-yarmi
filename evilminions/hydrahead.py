@@ -31,13 +31,15 @@ def _jid_key_from_pub(load):
 
 class HydraHead(object):
     '''Replicates the behavior of a minion'''
-    def __init__(self, minion_id, io_loop, keysize, opts, grains, ramp_up_delay, slowdown_factor, reactions, reactions_by_jid):
+    def __init__(self, minion_id, io_loop, keysize, opts, grains, ramp_up_delay, slowdown_factor, reactions, reactions_by_jid,
+                 mimic_poll_interval=0.05):
         self.minion_id = minion_id
         self.io_loop = io_loop
         self.ramp_up_delay = ramp_up_delay
         self.slowdown_factor = slowdown_factor
         self.reactions = reactions
         self.reactions_by_jid = reactions_by_jid
+        self.mimic_poll_interval = mimic_poll_interval
         self.current_time = 0
 
         self.current_jobs = []
@@ -128,20 +130,35 @@ class HydraHead(object):
     @tornado.gen.coroutine
     def mimic(self, load):
         '''Finds appropriate reactions to a PUB message and dispatches them'''
-        load = load['load']
-        fun = load['fun']
-        tgt = load['tgt']
-        tgt_type = load['tgt_type']
+        load = load.get('load')
+        if not isinstance(load, dict):
+            return
+        fun = load.get('fun')
+        tgt = load.get('tgt')
+        tgt_type = load.get('tgt_type')
 
         if tgt_type == 'glob':
-            is_targeted = fnmatch.fnmatch(self.minion_id, tgt)
+            is_targeted = bool(tgt) and fnmatch.fnmatch(self.minion_id, tgt)
         elif tgt_type == 'list':
-            is_targeted = self.minion_id in tgt
+            if isinstance(tgt, str):
+                is_targeted = self.minion_id == tgt
+            elif isinstance(tgt, (list, tuple)) and len(tgt) > 256:
+                try:
+                    is_targeted = self.minion_id in frozenset(tgt)
+                except TypeError:
+                    is_targeted = self.minion_id in tgt
+            elif isinstance(tgt, (list, tuple)):
+                is_targeted = self.minion_id in tgt
+            else:
+                is_targeted = False
         else:
             is_targeted = tgt == self.minion_id
 
         if not is_targeted:
             # ignore call that targets a different minion
+            return
+
+        if fun is None:
             return
 
         # react in ad-hoc ways to some special calls
@@ -181,7 +198,7 @@ class HydraHead(object):
                         break
                 if reactions:
                     break
-                yield tornado.gen.sleep(0.05)
+                yield tornado.gen.sleep(self.mimic_poll_interval)
 
             if not reactions:
                 self.log.error("No reaction for %s call_ids=%s jid=%s", fun, call_ids, jid_key)

@@ -3,6 +3,7 @@
 import logging
 import inspect
 import os
+import threading
 import time
 
 import tornado.gen
@@ -14,11 +15,16 @@ from salt.channel.client import AsyncReqChannel
 
 log = logging.getLogger(__name__)
 
+_PROXY_PULL = 'ipc:///tmp/evil-minions-pull.ipc'
+
+
 class Vampire(object):
     '''Intercepts traffic to and from the minion via monkey patching and sends it into the Proxy.'''
 
     def __init__(self):
         self.context = zmq.Context.instance()
+        self._push = None
+        self._push_lock = threading.Lock()
 
     def attach(self):
         '''Monkey-patches ZeroMQ core I/O class to capture flowing messages.'''
@@ -31,6 +37,27 @@ class Vampire(object):
         AsyncPubChannel.dump = self.dump
         AsyncPubChannel._original_on_recv = AsyncPubChannel.on_recv
         AsyncPubChannel.on_recv = _dumping_on_recv
+
+    def _push_close(self):
+        if self._push is not None:
+            try:
+                self._push.close(linger=0)
+            except Exception:
+                pass
+            self._push = None
+
+    def _push_connect(self):
+        if self._push is not None:
+            return
+        sock = self.context.socket(zmq.PUSH)
+        try:
+            sock.setsockopt(zmq.SNDHWM, 100000)
+            sock.setsockopt(zmq.LINGER, 3000)
+            sock.connect(_PROXY_PULL)
+            self._push = sock
+        except Exception:
+            sock.close(linger=0)
+            raise
 
     def dump(self, load, socket, method, **kwargs):
         '''Dumps a ZeroMQ message to the Proxy'''
@@ -47,21 +74,15 @@ class Vampire(object):
             'load' : load,
         }
 
-        zsocket = None
-        try:
-            zsocket = self.context.socket(zmq.PUSH)
-            zsocket.setsockopt(zmq.SNDHWM, 100000)
-            zsocket.setsockopt(zmq.LINGER, 3000)
-            zsocket.connect('ipc:///tmp/evil-minions-pull.ipc')
-            # Blocking send + non-zero linger: NOBLOCK + linger(0) could drop
-            # bursts (e.g. _return and crypto traffic) before the proxy PULL reads.
-            zsocket.send(salt.payload.dumps(event))
-        except Exception as exc:
-            log.error("Event: {}".format(event))
-            log.error("Unable to dump event: {}".format(exc))
-        finally:
-            if zsocket is not None:
-                zsocket.close()
+        payload = salt.payload.dumps(event)
+        with self._push_lock:
+            try:
+                self._push_connect()
+                self._push.send(payload)
+            except Exception as exc:
+                log.error("Event: {}".format(event))
+                log.error("Unable to dump event: {}".format(exc))
+                self._push_close()
 
 @tornado.gen.coroutine
 def _dumping_send(self, load, **kwargs):

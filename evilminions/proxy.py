@@ -3,8 +3,12 @@
 import logging
 import zmq
 
+from evilminions.worker_logging import setup as setup_worker_logging
+
+
 def start_proxy(semaphore):
     '''Relays traffic from Vampire to Hydras.'''
+    setup_worker_logging()
     # set up logging
     log = logging.getLogger(__name__)
 

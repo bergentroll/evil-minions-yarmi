@@ -15,6 +15,7 @@ import random
 
 from evilminions.hydrahead import HydraHead
 from evilminions.utils import fun_call_id, fun_call_id_variants
+from evilminions.worker_logging import setup as setup_worker_logging
 
 class Hydra(object):
     '''Spawns HydraHeads, listens for messages coming from the Vampire.'''
@@ -27,9 +28,11 @@ class Hydra(object):
         self.log = None
 
     def start(self, hydra_count, chunk, prefix, offset,
-              ramp_up_delay, slowdown_factor, random_slowdown_factor, keysize, semaphore):
+              ramp_up_delay, slowdown_factor, random_slowdown_factor, keysize,
+              mimic_poll_interval, semaphore):
         '''Per-process entry point (one per Hydra)'''
 
+        setup_worker_logging()
         # set up logging
         self.log = logging.getLogger(__name__)
         self.log.debug("Starting Hydra on: %s", chunk)
@@ -58,7 +61,8 @@ class Hydra(object):
 
         slowdown_factors = self._resolve_slowdown_factors(slowdown_factor, random_slowdown_factor, len(chunk))
         heads = [HydraHead('{}-{}'.format(prefix, offset_head_numbers[i]), io_loop, keysize, opts, grains, delays[i],
-                           slowdown_factors[i], self.reactions, self.reactions_by_jid)
+                           slowdown_factors[i], self.reactions, self.reactions_by_jid,
+                           mimic_poll_interval=mimic_poll_interval)
                  for i in range(len(chunk))]
 
         # start heads!
