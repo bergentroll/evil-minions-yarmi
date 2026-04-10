@@ -24,8 +24,24 @@ def replace_recursively(replacements, dump):
 
 def fun_call_id(fun, args):
     '''Returns a hashable object that represents the call of a function, with actual parameters'''
-    clean_args = [_zap_uyuni_specifics(_zap_kwarg(arg)) for arg in args or []]
+    clean_args = [_zap_runtime_noise(_zap_uyuni_specifics(_zap_kwarg(arg))) for arg in args or []]
     return (fun, _immutable(clean_args))
+
+
+def fun_call_id_variants(fun, args):
+    '''Multiple call_ids: PUB ``arg`` and REQ ``fun_args`` often differ by trailing kwargs dicts.'''
+    args = list(args or [])
+    seen = set()
+    variants = []
+    while True:
+        cid = fun_call_id(fun, args)
+        if cid not in seen:
+            seen.add(cid)
+            variants.append(cid)
+        if not args or not isinstance(args[-1], dict):
+            break
+        args = args[:-1]
+    return variants
 
 def _zap_kwarg(arg):
     '''Takes a list/dict stucture and returns a copy with '__kwarg__' keys removed'''
@@ -43,6 +59,29 @@ def _zap_uyuni_specifics(data):
             return {k: _zap_uyuni_specifics(v) for k, v in data.items()}
     if isinstance(data, list):
         return [_zap_uyuni_specifics(e) for e in data]
+    return data
+
+def _zap_runtime_noise(data):
+    '''Remove runtime-varying fields that should not affect reaction matching'''
+    noisy_keys = {
+        '__pub_arg',
+        '__pub_fun',
+        '__pub_fun_args',
+        '__pub_id',
+        '__pub_jid',
+        '__pub_pid',
+        '__pub_ret',
+        '__pub_tgt',
+        '__pub_tgt_type',
+        '__pub_user',
+        'jid',
+        'pid',
+        'metadata',
+    }
+    if isinstance(data, dict):
+        return {k: _zap_runtime_noise(v) for k, v in data.items() if k not in noisy_keys}
+    if isinstance(data, list):
+        return [_zap_runtime_noise(e) for e in data]
     return data
 
 def _immutable(data):

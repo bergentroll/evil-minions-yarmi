@@ -14,7 +14,7 @@ import salt.payload
 import random
 
 from evilminions.hydrahead import HydraHead
-from evilminions.utils import fun_call_id
+from evilminions.utils import fun_call_id, fun_call_id_variants
 
 class Hydra(object):
     '''Spawns HydraHeads, listens for messages coming from the Vampire.'''
@@ -22,6 +22,7 @@ class Hydra(object):
         self.hydra_number = hydra_number
         self.current_reactions = {}
         self.reactions = {}
+        self.reactions_by_jid = {}
         self.last_time = None
         self.log = None
 
@@ -57,7 +58,8 @@ class Hydra(object):
 
         slowdown_factors = self._resolve_slowdown_factors(slowdown_factor, random_slowdown_factor, len(chunk))
         heads = [HydraHead('{}-{}'.format(prefix, offset_head_numbers[i]), io_loop, keysize, opts, grains, delays[i],
-                           slowdown_factors[i], self.reactions) for i in range(len(chunk))]
+                           slowdown_factors[i], self.reactions, self.reactions_by_jid)
+                 for i in range(len(chunk))]
 
         # start heads!
         for head in heads:
@@ -106,17 +108,23 @@ class Hydra(object):
                 self.current_reactions[pid] = self.current_reactions.get(pid, []) + [event]
 
                 if load['cmd'] == '_return':
-                    call_id = fun_call_id(load['fun'], load['fun_args'])
-
-                    if call_id not in self.reactions:
-                        self.reactions[call_id] = []
-
-                    self.reactions[call_id] = self.reactions.get(call_id, []) + [self.current_reactions[pid]]
-                    self.log.debug("Hydra #{} learned reaction list #{} ({} reactions) for call: {}".format(
-                                                                                        self.hydra_number,
-                                                                                        len(self.reactions[call_id]),
-                                                                                        len(self.current_reactions[pid]),
-                                                                                        call_id))
+                    chain = self.current_reactions[pid]
+                    # REQ _return usually has fun_args; mirror PUB-style arg if both differ.
+                    call_ids = set()
+                    for args in (load.get('fun_args'), load.get('arg')):
+                        if args is None:
+                            continue
+                        for cid in fun_call_id_variants(load['fun'], args):
+                            call_ids.add(cid)
+                    for call_id in call_ids:
+                        if call_id not in self.reactions:
+                            self.reactions[call_id] = []
+                        self.reactions[call_id].append(chain)
+                    jid = load.get('jid')
+                    if jid is not None:
+                        self.reactions_by_jid[str(jid)] = chain
+                    self.log.debug("Hydra #{} learned reaction list ({} reactions) for fun {}".format(
+                        self.hydra_number, len(chain), load.get('fun')))
                     for reaction in self.current_reactions[pid]:
                         load = reaction['load']
                         cmd = load['cmd']

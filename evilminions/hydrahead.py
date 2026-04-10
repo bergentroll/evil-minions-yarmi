@@ -14,16 +14,30 @@ import zmq
 
 import salt.channel.client
 
-from evilminions.utils import replace_recursively, fun_call_id
+from evilminions.utils import replace_recursively, fun_call_id_variants
+
+
+def _jid_key_from_pub(load):
+    '''Salt sometimes puts jid only on nested job payload; normalize to str for dict lookup.'''
+    j = load.get('jid')
+    if j is None:
+        inner = load.get('load')
+        if isinstance(inner, dict):
+            j = inner.get('jid')
+    if j is None:
+        return None
+    return str(j)
+
 
 class HydraHead(object):
     '''Replicates the behavior of a minion'''
-    def __init__(self, minion_id, io_loop, keysize, opts, grains, ramp_up_delay, slowdown_factor, reactions):
+    def __init__(self, minion_id, io_loop, keysize, opts, grains, ramp_up_delay, slowdown_factor, reactions, reactions_by_jid):
         self.minion_id = minion_id
         self.io_loop = io_loop
         self.ramp_up_delay = ramp_up_delay
         self.slowdown_factor = slowdown_factor
         self.reactions = reactions
+        self.reactions_by_jid = reactions_by_jid
         self.current_time = 0
 
         self.current_jobs = []
@@ -138,14 +152,41 @@ class HydraHead(object):
         elif fun == 'saltutil.running':
             yield self.react_to_running(load)
         else:
-            # try to find a suitable reaction and use it
-            call_id = fun_call_id(load['fun'], load['arg'] or [])
+            # Wait for real-minion capture: same jid (preferred) or any matching call_id variant.
+            call_ids = []
+            _seen = set()
+            for args in (load.get('arg'), load.get('fun_args')):
+                if args is None:
+                    continue
+                for cid in fun_call_id_variants(load['fun'], args):
+                    if cid not in _seen:
+                        _seen.add(cid)
+                        call_ids.append(cid)
+            jid_key = _jid_key_from_pub(load)
+            reactions = None
+            raw_to = load.get('to')
+            try:
+                wait_timeout = float(raw_to) if raw_to is not None else 10.0
+            except (TypeError, ValueError):
+                wait_timeout = 10.0
+            deadline = time.time() + max(1.0, min(wait_timeout, 30.0))
 
-            reactions = self.get_reactions(call_id)
-            while not reactions:
-                self.log.debug("No known reaction for call: {}, sleeping 1 second and retrying".format(call_id))
-                yield tornado.gen.sleep(1)
-                reactions = self.get_reactions(call_id)
+            while time.time() < deadline:
+                if jid_key and jid_key in self.reactions_by_jid:
+                    reactions = self.reactions_by_jid[jid_key]
+                    break
+                for cid in call_ids:
+                    reactions = self.get_reactions(cid)
+                    if reactions:
+                        break
+                if reactions:
+                    break
+                yield tornado.gen.sleep(0.05)
+
+            if not reactions:
+                self.log.error("No reaction for %s call_ids=%s jid=%s", fun, call_ids, jid_key)
+                yield self.react_no_reaction(load)
+                return
 
             self.current_time = reactions[0]['header']['time']
             yield self.react(load, reactions)
@@ -160,7 +201,9 @@ class HydraHead(object):
         # historical order (pick the one which has the lowest timestamp after the last processed)
         future_reaction_sets = [s for s in reaction_sets if s[0]['header']['time'] >= self.current_time]
         if future_reaction_sets:
-            return future_reaction_sets[0]
+            # Same call_id can be learned many times (repeated identical calls). Prefer the
+            # most recently captured chain, not list order (oldest-first used to replay stale cmd.run).
+            return max(future_reaction_sets, key=lambda s: s[0]['header']['time'])
 
         # if there are reactions but none of them were recorded later than the last processed one, meaning
         # we are seeing an out-of-order request compared to the original ordering, let's be content and return
@@ -171,24 +214,56 @@ class HydraHead(object):
     def react(self, load, original_reactions):
         '''Dispatches reactions in response to typical functions'''
         self.current_jobs.append(load)
-        reactions = replace_recursively(self.replacements, original_reactions)
+        try:
+            reactions = replace_recursively(self.replacements, original_reactions)
 
-        self.current_jobs.append(load)
-        for reaction in reactions:
-            request = reaction['load']
-            if 'tok' in request:
-                request['tok'] = self.tok
-            if request['cmd'] == '_return' and request.get('fun') == load.get('fun'):
-                request['jid'] = load['jid']
-                if 'metadata' in load:
-                    request['metadata']['suma-action-id'] = load['metadata'].get('suma-action-id')
-            header = reaction['header']
-            duration = header['duration']
-            yield tornado.gen.sleep(duration * self.slowdown_factor)
-            method = header['method']
-            kwargs = header['kwargs']
-            yield getattr(self.req_channel, method)(request, **kwargs)
-        self.current_jobs.remove(load)
+            pub_call_ids = set()
+            for args in (load.get('arg'), load.get('fun_args')):
+                if args is None:
+                    continue
+                for cid in fun_call_id_variants(load['fun'], args):
+                    pub_call_ids.add(cid)
+
+            for reaction in reactions:
+                request = reaction['load']
+                if 'tok' in request:
+                    request['tok'] = self.tok
+                if request['cmd'] == '_return' and request.get('fun') == load.get('fun'):
+                    r_args = request.get('fun_args') or request.get('arg') or []
+                    ret_ids = set(fun_call_id_variants(request.get('fun'), r_args))
+                    if pub_call_ids and not (pub_call_ids & ret_ids):
+                        # Drop a stale _return from an older baseline still present in the same chain.
+                        continue
+                    request['jid'] = load['jid']
+                    if 'metadata' in load and isinstance(request.get('metadata'), dict):
+                        request['metadata']['suma-action-id'] = load['metadata'].get('suma-action-id')
+                header = reaction['header']
+                duration = header['duration']
+                yield tornado.gen.sleep(duration * self.slowdown_factor)
+                method = header['method']
+                kwargs = header['kwargs']
+                yield getattr(self.req_channel, method)(request, **kwargs)
+        finally:
+            try:
+                self.current_jobs.remove(load)
+            except ValueError:
+                pass
+
+    @tornado.gen.coroutine
+    def react_no_reaction(self, load):
+        '''Returns an explicit error if no baseline reaction is available yet'''
+        fun = load.get('fun')
+        request = {
+            'cmd': '_return',
+            'fun': fun,
+            'fun_args': load.get('arg') or load.get('fun_args') or [],
+            'id': self.minion_id,
+            'jid': load.get('jid'),
+            'retcode': 1,
+            'return': "evil-minions: no real-minion baseline response for '{}' yet; run the command once against a real minion and retry".format(fun),
+            'success': False,
+        }
+        yield self.req_channel.send(request, timeout=60)
 
     @tornado.gen.coroutine
     def react_to_ping(self, load):
@@ -237,3 +312,4 @@ class HydraHead(object):
             'success': True,
         }
         yield self.req_channel.send(request, timeout=60)
+

@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 
 # Salt onedir packages ship their own Python; re-exec into it when needed.
 if not os.environ.get("EVIL_MINIONS_BOOTSTRAPPED"):
@@ -85,6 +86,8 @@ def main():
     proxy = Process(target=start_proxy, kwargs={'semaphore': semaphore})
     proxy.start()
     semaphore.acquire()
+    # Brief pause so PUB subscribers finish handshaking before real minion traffic.
+    time.sleep(0.5)
 
     # restore salt-minion's orignal command line args and launch it
     sys.argv = [sys.argv[0]] + remaining_args

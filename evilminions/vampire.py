@@ -47,14 +47,21 @@ class Vampire(object):
             'load' : load,
         }
 
+        zsocket = None
         try:
             zsocket = self.context.socket(zmq.PUSH)
+            zsocket.setsockopt(zmq.SNDHWM, 100000)
+            zsocket.setsockopt(zmq.LINGER, 3000)
             zsocket.connect('ipc:///tmp/evil-minions-pull.ipc')
-            zsocket.send(salt.payload.dumps(event), flags=zmq.NOBLOCK)
-            zsocket.close(linger=0)
+            # Blocking send + non-zero linger: NOBLOCK + linger(0) could drop
+            # bursts (e.g. _return and crypto traffic) before the proxy PULL reads.
+            zsocket.send(salt.payload.dumps(event))
         except Exception as exc:
             log.error("Event: {}".format(event))
             log.error("Unable to dump event: {}".format(exc))
+        finally:
+            if zsocket is not None:
+                zsocket.close()
 
 @tornado.gen.coroutine
 def _dumping_send(self, load, **kwargs):
