@@ -7,6 +7,7 @@ import threading
 import time
 
 import tornado.gen
+import tornado.ioloop
 import zmq
 
 import salt.payload
@@ -100,9 +101,14 @@ def _dumping_crypted_transfer_decode_dictentry(self, load, **kwargs):
 
 def _dumping_on_recv(self, callback):
     '''Dumps a PUB ZeroMQ message then handles it'''
-    async def _logging_callback(load):
+    # Version-agnostic callback:
+    # - If Salt calls callback() synchronously, we still run async callbacks.
+    # - If Salt awaits callback(), returning None is still valid.
+    def _logging_callback(load):
         self.dump(load, 'PUB', 'on_recv')
         result = callback(load)
         if inspect.isawaitable(result):
-            await result
+            async def _await_result():
+                await result
+            tornado.ioloop.IOLoop.current().spawn_callback(_await_result)
     return self._original_on_recv(_logging_callback)

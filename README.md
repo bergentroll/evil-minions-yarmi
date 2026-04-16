@@ -11,6 +11,7 @@
 База: `uyuni-project/evil-minions`. В данном репозитории:
 
 - Salt 3007.x, onedir, запуск через `/opt/saltstack/salt/bin/python3.10`;
+- совместимость callback-перехвата `AsyncPubChannel.on_recv` между Salt 3006.x и 3007.x (без жёсткой привязки к версии);
 - совместимость с Python 3.13 (отказ от `distutils` в пользу `shutil.which` и аналогов там, где нужно);
 - перехват через актуальный `salt.channel.client`;
 - доработки асинхронных callback;
