@@ -105,7 +105,7 @@ class Hydra(object):
                     self.log.debug(" - {}({})".format(cmd, pid))
 
             if socket == 'REQ':
-                if load['cmd'] == '_auth':
+                if load['cmd'] in ('_auth', '_minion_event'):
                     continue
                 pid = event['header']['pid']
 
