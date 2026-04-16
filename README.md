@@ -8,17 +8,17 @@
 
 ### Форк от upstream
 
-База: `uyuni-project/evil-minions`. В данном репозитории:
+База: `uyuni-project/evil-minions`. Изменения в этом репозитории:
 
-- Salt 3007.x, onedir, запуск через `/opt/saltstack/salt/bin/python3.10`;
-- совместимость callback-перехвата `AsyncPubChannel.on_recv` между Salt 3006.x и 3007.x (без жёсткой привязки к версии);
-- совместимость с Python 3.13 (отказ от `distutils` в пользу `shutil.which` и аналогов там, где нужно);
+- onedir-окружение Salt, основная проверка на 3007.x;
+- совместимость callback-перехвата `AsyncPubChannel.on_recv` между Salt 3006.x и 3007.x;
+- совместимость с Python 3.13 (отказ от `distutils`);
 - перехват через актуальный `salt.channel.client`;
 - доработки асинхронных callback;
 - таргетинг `glob` для шаблонов вида `evil-*`;
 - один ZMQ PUSH на процесс при пересылке событий в прокси (вместо сокета на сообщение);
 - `--log-level`, уровень наследуется в дочерних процессах (`EVIL_MINIONS_LOG_LEVEL`);
-- число процессов Hydra: из `--processes` либо авто от `--count` и `cpu_count()` (верхняя граница 56);
+- число процессов Hydra: из `--processes` либо авто от `--count` и `cpu_count()`;
 - интервал ожидания baseline в `mimic()`: из `--mimic-poll` либо авто от `--count`;
 - корректный выход из `mimic()` при стартовом вызове с `fun is None`.
 
@@ -36,7 +36,7 @@ zypper install evil-minions
 **Исходники (Debian/Ubuntu и др.)**:
 
 ```bash
-git clone https://github.com/moio/evil-minions.git
+git clone https://github.com/v-yarmiychuk/evil-minions.git
 cd evil-minions
 sudo apt-get install -y python3-msgpack python3-zmq python3-tornado
 ```
@@ -51,12 +51,12 @@ sudo systemctl daemon-reload
 sudo systemctl restart salt-minion
 ```
 
-Пример `ExecStart` для onedir (пути и `--count` правятся под среду):
+Пример `ExecStart` для onedir (путь к python укажите под вашу установку):
 
 ```ini
 [Service]
 ExecStart=
-ExecStart=/opt/saltstack/salt/bin/python3.10 /path/to/evil-minions/evil-minions --count=100 --ramp-up-delay=0 --slowdown-factor=0.0 --log-level=INFO
+ExecStart=/opt/saltstack/salt/bin/python /path/to/evil-minions/evil-minions --count=100 --ramp-up-delay=0 --slowdown-factor=0.0 --log-level=INFO
 WorkingDirectory=/path/to/evil-minions
 ```
 
