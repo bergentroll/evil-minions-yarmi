@@ -62,6 +62,26 @@ WorkingDirectory=/path/to/evil-minions
 
 В репозитории `override.conf` содержит тот же шаблон; фактическое число minion задаётся в `ExecStart`. Справка по ключам: `evil-minions --help`.
 
+Рекомендуется добавить отдельный drop-in c обязательными переменными окружения
+для стабильных ключей и предсказуемого запуска:
+
+```ini
+# /etc/systemd/system/salt-minion.service.d/evil-minions-env.conf
+[Service]
+Environment=EVIL_MINIONS_PKI_BASE=/var/lib/evil-minions/pki
+Environment=EVIL_MINIONS_GRAINS_PROFILES=/opt/evil-minions/data/grains.json
+Environment=EVIL_MINIONS_REQUIRE_GRAINS_PROFILES=true
+Environment=EVIL_MINIONS_ID_SOURCE=profile
+Environment=EVIL_MINIONS_ENFORCE_UNIQUE_IDS=true
+```
+
+После добавления:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart salt-minion
+```
+
 ### Параметры запуска
 
 | Параметр | Назначение |
@@ -76,6 +96,21 @@ WorkingDirectory=/path/to/evil-minions
 | `--keysize` | Размер ключей minion, бит (дефолт 2048). |
 | `--log-level` | `DEBUG` … `CRITICAL`, дефолт `INFO`. |
 
+По умолчанию PKI evil-minions хранится в постоянном каталоге `/var/lib/evil-minions/pki/<minion_id>`.
+При необходимости базовый путь можно переопределить переменной окружения `EVIL_MINIONS_PKI_BASE`.
+
+Дедупликация `_return` включена по умолчанию и работает по паре `(minion_id, jid)`.
+Если `jid` пустой (`None`/`''`), дедупликация не применяется.
+Параметры через env: `EVIL_MINIONS_DEDUP_TTL_SEC` (по умолчанию `180`), `EVIL_MINIONS_DEDUP_MAX` (по умолчанию `30000`).
+
+Для grains профилей поле `master` из `data/grains.json` игнорируется: при старте
+оно принудительно берётся из grains реального minion.
+
+При старте каждой головы во все основные сетевые поля grains подставляется **реальный
+исходящий IPv4** к мастеру (тот же адрес, что видит мастер на TCP-сокете). Так
+совпадает кэш presence на мастере с адресами из `grains.items`, если в профиле
+были «чужие» IP из снимка. Отключить: `EVIL_MINIONS_REAL_IP_OVERLAY=0` (или `false`/`no`).
+
 ### Проверка
 
 ```bash
@@ -84,6 +119,47 @@ salt 'evil-*' test.ping
 ```
 
 Команда без baseline у эталонного minion: ответ с ошибкой до первого успешного выполнения на реальном minion с тем же `fun`/аргументами.
+
+### Troubleshooting: ключи и регистрация
+
+#### Симптомы
+
+- В логах master: `Authentication attempt from <minion_id> failed, the public keys did not match`.
+- В `salt-key -L` один и тот же minion может оказаться в конфликтных состояниях (например, после ручной чистки PKI на клиенте и старых ключей на мастере).
+- Синхронные `salt ...` иногда дают timeout под нагрузкой event bus, при этом async-джобы могут успешно возвращаться.
+
+#### Важно понимать
+
+- При **обычном restart** `salt-minion` ключи evil-minions не обязаны меняться, если
+  сохраняется каталог `EVIL_MINIONS_PKI_BASE`.
+- Проблема обычно появляется после потери/очистки локального PKI у evil-minions
+  или рассинхрона key-state на мастере.
+
+#### Безопасный сценарий восстановления key-state
+
+1) На evil-host (где запущен evil-minions):
+
+```bash
+sudo systemctl stop salt-minion
+# Чистить PKI только если действительно нужен полный ресинк ключей:
+sudo rm -rf /var/lib/evil-minions/pki/*
+sudo systemctl start salt-minion
+```
+
+2) На Salt master (в контейнере, если master контейнеризирован):
+
+```bash
+docker exec -it <master_container> salt-key -L
+docker exec -it <master_container> salt-key -d 'evil-*' -y
+docker exec -it <master_container> salt-key -a 'evil-*' -y
+```
+
+3) Проверка:
+
+```bash
+docker exec -it <master_container> salt 'evil-*' test.ping --async
+docker exec -it <master_container> salt-run jobs.lookup_jid <jid>
+```
 
 ### Ограничения
 

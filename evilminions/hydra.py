@@ -1,6 +1,9 @@
 '''Replicates the behavior of a minion many times'''
 
 import logging
+import json
+import math
+import os
 
 import tornado.gen
 import zmq
@@ -26,6 +29,10 @@ class Hydra(object):
         self.reactions_by_jid = {}
         self.last_time = None
         self.log = None
+        self._profiles = None
+        self._profile_mul = None
+        self._profile_add = 17
+        self._assigned_minion_ids = set()
 
     def start(self, hydra_count, chunk, prefix, offset,
               ramp_up_delay, slowdown_factor, random_slowdown_factor, keysize,
@@ -52,18 +59,33 @@ class Hydra(object):
         # Load original settings and grains
         opts = salt.config.minion_config('/etc/salt/minion')
         grains = salt.loader.grains(opts)
+        self._load_grains_profiles()
 
         # set up heads!
         first_head_number = chunk[0] if chunk else 0
         delays = [ramp_up_delay * ((head_number - first_head_number) * hydra_count + self.hydra_number)
                   for head_number in chunk]
         offset_head_numbers = [head_number + offset for head_number in chunk]
+        if self._profiles and offset_head_numbers and (max(offset_head_numbers) + 1) > len(self._profiles):
+            self.log.warning(
+                "Profiles count (%d) is lower than requested evil minions (%d); profile reuse is expected",
+                len(self._profiles), max(offset_head_numbers) + 1
+            )
 
         slowdown_factors = self._resolve_slowdown_factors(slowdown_factor, random_slowdown_factor, len(chunk))
-        heads = [HydraHead('{}-{}'.format(prefix, offset_head_numbers[i]), io_loop, keysize, opts, grains, delays[i],
-                           slowdown_factors[i], self.reactions, self.reactions_by_jid,
-                           mimic_poll_interval=mimic_poll_interval)
-                 for i in range(len(chunk))]
+        heads = []
+        for i in range(len(chunk)):
+            generated_id = '{}-{}'.format(prefix, offset_head_numbers[i])
+            grains_profile = self._pick_grains_profile(offset_head_numbers[i])
+            minion_id = self._resolve_minion_id(offset_head_numbers[i], generated_id, grains_profile)
+            heads.append(
+                HydraHead(
+                    minion_id, io_loop, keysize, opts, grains, delays[i],
+                    slowdown_factors[i], self.reactions, self.reactions_by_jid,
+                    grains_profile=grains_profile,
+                    mimic_poll_interval=mimic_poll_interval
+                )
+            )
 
         # start heads!
         for head in heads:
@@ -76,6 +98,104 @@ class Hydra(object):
     def _resolve_slowdown_factors(self, slowdown_factor, random_slowdown_factor, heads_count):
         random.seed(self.hydra_number)
         return [(slowdown_factor + random.randint(0, random_slowdown_factor * 100) / 100.0) for i in range(heads_count)]
+
+    def _load_grains_profiles(self):
+        if self._profiles is not None:
+            return
+        env_path = os.environ.get('EVIL_MINIONS_GRAINS_PROFILES')
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate_paths = []
+        if env_path:
+            candidate_paths.append(env_path)
+        candidate_paths.extend([
+            os.path.join(os.getcwd(), 'data', 'grains.json'),
+            os.path.join(repo_root, 'data', 'grains.json'),
+            '/opt/evil-minions/data/grains.json',
+        ])
+        # Keep order, drop duplicates.
+        seen = set()
+        unique_paths = []
+        for p in candidate_paths:
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            unique_paths.append(p)
+
+        loaded_from = None
+        last_exc = None
+        loaded = None
+        for path in unique_paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                loaded_from = path
+                break
+            except Exception as exc:
+                last_exc = exc
+
+        try:
+            if isinstance(loaded, list):
+                self._profiles = [x for x in loaded if isinstance(x, dict)]
+            else:
+                self._profiles = []
+        except Exception:
+            self._profiles = []
+
+        if self._profiles:
+            m = len(self._profiles)
+            mul = 65537
+            while math.gcd(mul, m) != 1:
+                mul += 2
+            self._profile_mul = mul
+            self.log.info("Loaded %d grains profiles from %s", m, loaded_from)
+        else:
+            self._profile_mul = None
+            if loaded_from:
+                self.log.warning("Grains profiles file found but empty/invalid list: %s", loaded_from)
+            elif last_exc is not None:
+                self.log.warning("Unable to parse grains profiles from candidates %s: %s", unique_paths, last_exc)
+            else:
+                self.log.warning("Grains profiles file not found in candidates: %s", unique_paths)
+
+            strict = os.environ.get('EVIL_MINIONS_REQUIRE_GRAINS_PROFILES', 'true').strip().lower()
+            if strict not in ('0', 'false', 'no'):
+                raise RuntimeError(
+                    "No grains profiles loaded; refusing to fallback to real host grains. "
+                    "Set EVIL_MINIONS_GRAINS_PROFILES or disable strict mode with "
+                    "EVIL_MINIONS_REQUIRE_GRAINS_PROFILES=0."
+                )
+
+    def _pick_grains_profile(self, head_number):
+        if not self._profiles or self._profile_mul is None:
+            return None
+        m = len(self._profiles)
+        idx = (self._profile_mul * head_number + self._profile_add) % m
+        return self._profiles[idx]
+
+    def _resolve_minion_id(self, head_number, generated_id, grains_profile):
+        source = os.environ.get('EVIL_MINIONS_ID_SOURCE', 'profile').strip().lower()
+        enforce_unique = os.environ.get('EVIL_MINIONS_ENFORCE_UNIQUE_IDS', 'true').strip().lower() not in ('0', 'false', 'no')
+        profile_id = None
+        if isinstance(grains_profile, dict):
+            profile_id = grains_profile.get('id')
+            if profile_id is not None:
+                profile_id = str(profile_id).strip()
+                if profile_id == '':
+                    profile_id = None
+
+        if source == 'profile' and profile_id:
+            candidate = profile_id
+        else:
+            candidate = generated_id
+
+        if enforce_unique and candidate in self._assigned_minion_ids:
+            candidate = '{}-evil-{}'.format(candidate, head_number)
+            self.log.warning("Duplicate minion id detected, adjusted to %s", candidate)
+
+        self._assigned_minion_ids.add(candidate)
+        return candidate
 
     @tornado.gen.coroutine
     def update_reactions(self, packed_events):
